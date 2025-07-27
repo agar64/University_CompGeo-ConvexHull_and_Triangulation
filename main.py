@@ -7,6 +7,7 @@ import numpy as np
 import math
 import os
 import time
+import random
 
 
 class Point:
@@ -25,25 +26,61 @@ class GrahamScanConvexHull:
         self.convex_hull = []
         self.start_time = None
         self.end_time = None
+        self.vertex_groups = {}  # Índice (int) -> nome do grupo/objeto
+        self.group_vertices = {}  # Nome do grupo -> lista de índices (int)
+        self.edges = []  # Lista de arestas: (idx1, idx2)
+        self.vertex_list = []  # Lista direta de vértices (na ordem original)
 
     def read_obj_file(self, filename):
-        """Lê pontos 2D de um arquivo .obj"""
+        """Lê pontos 2D de um arquivo .obj com suporte a grupos/objetos."""
         self.points = []
         self.lines = []
+        self.vertex_groups = {}
+        self.group_vertices = {}
+        self.edges = []
+        self.vertex_list = []
+
+        current_group = "default"
+        vertex_index = 1  # Começa em 1 porque o .obj é 1-based
+
         try:
             with open(filename, 'r') as file:
                 for line in file:
                     line = line.strip()
-                    if line.startswith('v '):  # Vertex line
+
+                    if line.startswith("o ") or line.startswith("g "):
+                        current_group = line[2:].strip()
+                        if current_group == "":
+                            current_group = "default"
+
+                    elif line.startswith("v "):
                         parts = line.split()
                         if len(parts) >= 3:
                             x, y = float(parts[1]), float(parts[2])
-                            self.points.append(Point(x, y))
-                    elif line.startswith('l '):  # Line definition
+                            pt = Point(x, y)
+                            self.points.append(pt)
+                            self.vertex_list.append(pt)
+
+                            # Registrar o grupo a que pertence
+                            self.vertex_groups[vertex_index] = current_group
+                            if current_group not in self.group_vertices:
+                                self.group_vertices[current_group] = []
+                            self.group_vertices[current_group].append(vertex_index)
+
+                            vertex_index += 1
+
+                    elif line.startswith("l "):
                         parts = line.split()
-                        indices = [int(idx) for idx in parts[1:]]
-                        self.lines.append(indices)
+                        if len(parts) >= 3:
+                            indices = [int(idx) for idx in parts[1:]]
+                            self.lines.append(indices)
+
+                            # Registrar como arestas
+                            for i in range(len(indices) - 1):
+                                self.edges.append((indices[i], indices[i + 1]))
+
             return True
+
         except Exception as e:
             print(f"Erro ao ler arquivo: {e}")
             return False
@@ -215,6 +252,32 @@ class GrahamScanConvexHull:
             print(f"Erro ao salvar arquivo: {e}")
             return False
 
+    def get_group_vertices_with_neighbors(self, group_name):
+        """Retorna os índices dos vértices do grupo + vizinhos conectados por arestas."""
+        if group_name not in self.group_vertices:
+            return []
+
+        base_indices = set(self.group_vertices[group_name])
+        neighbor_indices = set()
+
+        for i, j in self.edges:
+            if i in base_indices:
+                neighbor_indices.add(j)
+            if j in base_indices:
+                neighbor_indices.add(i)
+
+        return sorted(base_indices.union(neighbor_indices))
+
+    def run_graham_scan_on_subset(self, point_list):
+        """Executa o Graham Scan sobre um subconjunto arbitrário de pontos."""
+        if len(point_list) < 3:
+            return point_list
+        temp = self.points
+        self.points = point_list
+        result = self.graham_scan()
+        self.points = temp
+        return result
+
 
 class ConvexHullGUI:
     def __init__(self, root):
@@ -226,6 +289,8 @@ class ConvexHullGUI:
         self.setup_ui()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        self.group_hulls = {}
 
     def on_closing(self):
         self.root.destroy()
@@ -255,6 +320,12 @@ class ConvexHullGUI:
 
         ttk.Button(control_frame, text="Passo a Passo",
                    command=self.run_step_by_step).grid(row=0, column=4, padx=(0, 5))
+
+        ttk.Button(control_frame, text="Fecho por Grupos",
+                   command=self.calculate_hull_per_group).grid(row=0, column=5, padx=(0, 5))
+
+        ttk.Button(control_frame, text="Unir Fechos",
+                   command=self.merge_group_hulls).grid(row=0, column=6, padx=(0, 5))
 
         # Labels de informação
         self.info_frame = ttk.Frame(main_frame)
@@ -396,6 +467,96 @@ class ConvexHullGUI:
                             f"Pontos Originais: {len(self.graham_scan.points)}\n"
                             f"Pontos no Fecho: {len(hull)}\n"
                             f"Tempo de Execução: {self.graham_scan.run_time()}")
+
+    def calculate_hull_per_group(self):
+        """Calcula o fecho convexo de cada grupo + vizinhos e armazena pontos e arestas."""
+        gs = self.graham_scan
+        if not gs.group_vertices:
+            messagebox.showwarning("Aviso", "O arquivo não contém grupos ou não foi carregado.")
+            return
+
+        self.group_hulls = {}
+
+        for group_name in gs.group_vertices:
+            indices = gs.get_group_vertices_with_neighbors(group_name)
+            points = [gs.vertex_list[i - 1] for i in indices]  # .obj é 1-based
+            if len(points) >= 3:
+                hull = gs.run_graham_scan_on_subset(points)
+
+                # Salvar pontos e arestas locais (com índices de 0 a len(hull)-1)
+                edges = [(i, (i + 1) % len(hull)) for i in range(len(hull))]
+
+                self.group_hulls[group_name] = {
+                    "points": hull,
+                    "edges": edges
+                }
+
+        self.plot_group_hulls(self.group_hulls)
+        messagebox.showinfo("Fecho por Grupos", f"{len(self.group_hulls)} fechos calculados com sucesso!")
+
+    def merge_group_hulls(self):
+        """Une os fechos por grupo topologicamente, fundindo vértices e corrigindo arestas."""
+        if not hasattr(self, "group_hulls") or not self.group_hulls:
+            messagebox.showwarning("Aviso", "Calcule os fechos por grupo antes de unir.")
+            return
+
+        # Mapeamento global de vértices por coordenadas
+        point_map = {}  # (x, y) -> novo índice
+        unified_points = []  # lista final de pontos
+        point_ids = {}  # id (grupo, idx_local) -> índice global
+
+        current_index = 1
+        for group, data in self.group_hulls.items():
+            for i, p in enumerate(data["points"]):
+                key = (round(p.x, 6), round(p.y, 6))  # tolerância
+                if key not in point_map:
+                    point_map[key] = current_index
+                    unified_points.append(p)
+                    current_index += 1
+                point_ids[(group, i)] = point_map[key]
+
+        # Reconstruir arestas usando índices globais
+        edge_set = set()
+        for group, data in self.group_hulls.items():
+            for i1, i2 in data["edges"]:
+                a = point_ids[(group, i1)]
+                b = point_ids[(group, i2)]
+                if a == b:
+                    continue
+                edge = tuple(sorted((a, b)))
+                if edge in edge_set:
+                    edge_set.remove(edge)  # aresta interna → remove
+                else:
+                    edge_set.add(edge)
+
+        # Salvar resultado final
+        self.unified_hull_points = unified_points
+        self.unified_hull_edges = sorted(edge_set)
+
+        self.plot_merged_hull()
+        messagebox.showinfo("Fecho Global",
+                            f"Fecho unido com {len(self.unified_hull_points)} pontos e {len(self.unified_hull_edges)} arestas.")
+
+    def plot_merged_hull(self):
+        """Plota os vértices e arestas externas do fecho global unido."""
+        self.ax.clear()
+
+        # Plotar vértices
+        for p in self.unified_hull_points:
+            self.ax.plot(p.x, p.y, 'bo', alpha=0.4)
+
+        # Plotar arestas externas
+        for a, b in self.unified_hull_edges:
+            p1 = self.unified_hull_points[a - 1]
+            p2 = self.unified_hull_points[b - 1]
+            self.ax.plot([p1.x, p2.x], [p1.y, p2.y], 'r-', linewidth=2)
+
+        self.ax.set_title("Fecho Global (Topológico)")
+        self.ax.set_xlabel("X")
+        self.ax.set_ylabel("Y")
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_aspect('equal')
+        self.canvas.draw()
 
     def save_result(self):
         """Salva o resultado"""
@@ -556,6 +717,35 @@ class ConvexHullGUI:
                 messagebox.showinfo("Concluído", "Passo a passo finalizado!")
 
         step()
+
+    def plot_group_hulls(self, group_hulls):
+        """Plota os fechos por grupo em cores distintas."""
+        self.ax.clear()
+
+        # Todos os pontos originais
+        if self.graham_scan.points:
+            x_coords = [p.x for p in self.graham_scan.points]
+            y_coords = [p.y for p in self.graham_scan.points]
+            self.ax.scatter(x_coords, y_coords, c='blue', alpha=0.3, s=30, label='Pontos')
+
+        # Plota cada fecho convexo com cor diferente
+        for group, data in group_hulls.items():
+            color = (random.random(), random.random(), random.random())
+            hull = data["points"]
+
+            xs = [p.x for p in hull] + [hull[0].x]
+            ys = [p.y for p in hull] + [hull[0].y]
+            self.ax.plot(xs, ys, color=color, linewidth=2, label=group)
+
+            self.ax.scatter([p.x for p in hull], [p.y for p in hull],
+                            c=[color], s=40, edgecolors='black')
+
+        self.ax.set_title("Fechos por Grupo")
+        self.ax.set_xlabel("X")
+        self.ax.set_ylabel("Y")
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_aspect('equal')
+        self.canvas.draw()
 
 
 '''def create_sample_obj_file():
